@@ -26,7 +26,11 @@ class FlexLogger {
     Optional<File::Error> append(const std::filesystem::path& filename) {
         return log_file.append(filename);
     }
-    void log_decoded(const Timestamp& timestamp, const std::string& data);
+    
+    void log_decoded(const Timestamp& timestamp, const std::string& data) {
+        // Just write the data directly to the log file
+        log_file.write_entry(timestamp, data);
+    }
 
    private:
     LogFile log_file{};
@@ -43,6 +47,7 @@ class FlexRxView : public View {
     void on_packet(const FlexPacketMessage& message);
     void on_stats(const FlexStatsMessage& stats);
     void on_freqchg(int64_t freq);
+    void on_manual_freq_change(int64_t freq);
 
     NavigationView& nav_;
     RxRadioState radio_state_{};
@@ -56,6 +61,10 @@ class FlexRxView : public View {
     bool last_has_sync{false};
     uint8_t last_frames{0};
     uint32_t last_bits{0};
+
+    uint32_t check_bch_checksum(uint32_t codeword);
+    std::string get_message_type_name(uint8_t type);
+    std::string to_string_hex(uint32_t value, int width);
 
     RFAmpField field_rf_amp{{13 * 8, 0 * 16}};
     LNAGainField field_lna{{15 * 8, 0 * 16}};

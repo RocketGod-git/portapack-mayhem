@@ -1,464 +1,446 @@
 /*
- * ------------------------------------------------------------
- * |  Made by RocketGod                                       |
- * |  Find me at https://betaskynet.com                       |
- * |  Argh matey!                                             |
- * ------------------------------------------------------------
+ * Copyright (C) 2015 Jared Boone, ShareBrained Technology, Inc.
+ * Copyright (C) 2023 RocketGod
+ *
+ * This file is part of PortaPack.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; see the file COPYING.  If not, write to
+ * the Free Software Foundation, Inc., 51 Franklin Street,
+ * Boston, MA 02110-1301, USA.
  */
 
 #include "proc_flex.hpp"
+#include "portapack_shared_memory.hpp"
 #include "event_m4.hpp"
 #include "audio_dma.hpp"
-#include "dsp_fir_taps.hpp"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstddef>
-#include <memory>
+// Symbol translation table - maps received modem status into symbols (from PDW)
+const int rcv_symbols[16] = {0, 1, 1, 2, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3};
 
-namespace {
+// FLEX sync patterns (from PDW)
+const uint16_t flex_syncs[8] = {0x870C, 0x7B18, 0xB068, 0xDEA0, 0x22B4, 0xE9C4, 0x4C7C, 0x34DF};
 
-uint8_t diff_bit_count(uint32_t left, uint32_t right) {
-    uint32_t diff = left ^ right;
-    uint8_t count = 0;
-    for (size_t i = 0; i < sizeof(diff) * 8; ++i) {
-        if (((diff >> i) & 0x1) == 1)
-            ++count;
+void FlexProcessor::execute(const buffer_c8_t& buffer) {
+    // This function is called at 3072000/2048 = 1500Hz
+
+    if (!configured) return;
+
+    // FM demodulation
+    const auto decim_0_out = decim_0.execute(buffer, dst_buffer);              // 2048/8 = 256 (512 I/Q samples)
+    const auto decim_1_out = decim_1.execute(decim_0_out, dst_buffer);         // 256/8 = 32 (64 I/Q samples)
+    const auto channel_out = channel_filter.execute(decim_1_out, dst_buffer);  // 32/2 = 16 (32 I/Q samples)
+
+    feed_channel_stats(channel_out);
+
+    auto audio = demod.execute(channel_out, audio_buffer);
+
+    audio_output.write(audio);
+
+    // Process the audio samples for FSK decoding
+    for (size_t c = 0; c < audio.count; c++) {
+        // Convert float sample to fixed-point
+        const int32_t sample_int = audio.p[c] * 32768.0f;
+        int32_t current_sample = __SSAT(sample_int, 16);
+        
+        // Scale down to prevent overflow in multiplication
+        current_sample /= 128;
+
+        // Delay line for correlation detection
+        delay_line[delay_line_index & 0x3F] = current_sample;
+
+        // Correlate with delayed sample (similar to PDW's FSK demodulation)
+        sample_mixed = (delay_line[(delay_line_index - 32) & 0x3F] * current_sample) / 4;
+        sample_filtered = prev_mixed + sample_mixed + (prev_filtered / 2);
+
+        delay_line_index++;
+
+        prev_filtered = sample_filtered;
+        prev_mixed = sample_mixed;
+
+        // Slice the signal to get symbols
+        sample_bits = (sample_bits << 1) | (sample_filtered < -20 ? 1 : 0);
+        
+        // Process the symbol through FLEX decoder state machine
+        process_flex_symbol(sample_filtered < -20 ? 3 : 0);
+    }
+    
+    // Send status updates every 250ms (approximated at our processing rate)
+    sync_counter++;
+    if (sync_counter >= 375) { // ~250ms at 1500Hz
+        sync_counter = 0;
+        send_status_update();
+    }
+}
+
+void FlexProcessor::process_flex_symbol(uint8_t symbol) {
+    // Shift sync buffer for sync pattern detection
+    for (int i = 0; i < 3; i++) {
+        sync_buffer[i] = sync_buffer[i + 1];
+    }
+    
+    // Add new bit to sync buffer
+    sync_buffer[3] = (sync_buffer[3] << 1) | (symbol > 0 ? 1 : 0);
+    
+    // If not synchronized, look for sync pattern
+    if (!sync_found) {
+        if (detect_flex_sync()) {
+            sync_found = true;
+            batch_index = 0;
+            for (size_t i = 0; i < batch.size(); i++) {
+                batch[i] = 0;
+            }
+            // Reset bit counter for frame information word
+            bit_counter = 0;
+            send_status_update();
+        }
+        return;
+    }
+    
+    // We are synchronized, collect bits to form words
+    phase += phase_inc;
+    
+    // Process bit at the right phase
+    if (phase >= 0x10000) {
+        phase &= 0xFFFF;
+        
+        // Add bit to current word
+        uint32_t bit_value = (symbol > 0) ? 1 : 0;
+        bit_counter++;
+        bits_processed++;
+        
+        // In 4-level FSK, we need to handle 2 bits per symbol
+        if (fsk_levels == 4) {
+            // TODO: Implement 4-level FSK decoding
+            // For now, just use 2-level FSK handling
+        }
+        
+        // Add this bit to the current batch word
+        if (batch_index < batch.size()) {
+            batch[batch_index] = (batch[batch_index] << 1) | bit_value;
+            
+            // Each word is 32 bits
+            if (bit_counter % 32 == 0) {
+                // Process completed word
+                batch_index++;
+                
+                // Process frame information from Block Information Word (BIW)
+                if (batch_index == 1) {
+                    decode_frame_info();
+                }
+                
+                // Handle end of frame
+                if (batch_index >= batch.size()) {
+                    frames_processed++;
+                    send_packet();
+                    sync_found = false;
+                }
+            }
+        }
+    }
+}
+
+bool FlexProcessor::detect_flex_sync() {
+    // First check if the central sync patterns match
+    int center_errors = count_bits(sync_buffer[1] ^ SYNC1) + count_bits(sync_buffer[2] ^ SYNC2);
+    
+    // Allow a few bit errors (up to 4) in the central sync pattern
+    if (center_errors <= 4) {
+        // Check for various FLEX frame sync patterns
+        for (int speed = 0; speed < 8; speed++) {
+            int edge_errors = count_bits(sync_buffer[0] ^ flex_syncs[speed]) + 
+                             count_bits(sync_buffer[3] ^ (flex_syncs[speed] ^ 0xFFFF));
+            
+            if (edge_errors <= 4) {  // Allow up to 4 bit errors
+                // Found a valid sync pattern
+                // Determine FLEX mode from sync pattern
+                if ((speed & 0x03) == 0) {
+                    baud_rate = FLEX_BAUD_1600;
+                    phase_inc = 0x10000 * 1600 / audio_fs;
+                } else if ((speed & 0x03) == 0x03) {
+                    baud_rate = FLEX_BAUD_6400;
+                    phase_inc = 0x10000 * 3200 / audio_fs;  // For 6400, we sample at 3200
+                } else {
+                    baud_rate = FLEX_BAUD_3200;
+                    phase_inc = 0x10000 * 3200 / audio_fs;
+                }
+                
+                fsk_levels = (speed & 0x02) ? 4 : 2;  // 2 or 4 level FSK
+                phase = 0;
+                
+                // Save current timestamp for the packet
+                timestamp = Timestamp::now();
+                
+                return true;
+            }
+        }
+    }
+    
+    // Check for end-of-transmission pattern
+    if ((sync_buffer[2] == EOT1) && (sync_buffer[3] == EOT2)) {
+        sync_found = false;
+        send_status_update();
+    }
+    
+    return false;
+}
+
+void FlexProcessor::decode_frame_info() {
+    // Apply BCH error correction to Block Information Word
+    uint32_t biw = bch_correct(batch[0]);
+    
+    // Extract frame information
+    current_cycle = (biw >> 19) & 0x0F;  // 4 bits
+    current_frame = (biw >> 16) & 0x07;  // 3 bits
+    
+    // Send status update with new frame information
+    send_status_update();
+}
+
+void FlexProcessor::process_addresses_and_vectors() {
+    // Process the batch to correct errors in all words
+    process_bch_block(batch.data(), batch.size());
+    
+    // Extract frame information from BIW (first word)
+    uint32_t frame_info = batch[0];
+    size_t vector_start = (frame_info >> 10) & 0x3F;     // Vector field start (6 bits)
+    size_t address_start = ((frame_info >> 8) & 0x03) + 1;  // Address field start (2 bits)
+    
+    // Skip processing if vector start is at the same position as address start
+    // (indicates an empty frame)
+    if (vector_start == address_start) {
+        return;
+    }
+    
+    // Process all addresses and their associated vectors
+    for (size_t addr_pos = address_start; addr_pos < vector_start && addr_pos < batch.size(); addr_pos++) {
+        uint32_t address_word = batch[addr_pos];
+        size_t vector_pos = vector_start + addr_pos - address_start;
+        
+        if (vector_pos >= batch.size()) continue;
+        
+        uint32_t vector_word = batch[vector_pos];
+        
+        // Check if this is a long address
+        bool long_address = false;
+        uint32_t address_data = address_word >> 11;
+        
+        if ((address_data & 0x7FFFF) < 0x008001 || 
+            ((address_data & 0x7FFFF) > 0x1E0000 && (address_data & 0x7FFFF) < 0x1F0001) || 
+            (address_data & 0x7FFFF) > 0x1F7FFE) {
+            long_address = true;
+        }
+        
+        // Skip if we have a long address but don't have the next word
+        if (long_address && addr_pos + 1 >= batch.size()) {
+            continue;
+        }
+        
+        // Get message type from vector word
+        uint8_t msg_type = (vector_word >> 4) & 0x07;
+        
+        // Process each message type differently
+        switch (msg_type) {
+            case TYPE_ALPHANUMERIC:
+                // Process alphanumeric message
+                // This would extract the message data from the batch words
+                break;
+                
+            case TYPE_STANDARD_NUM:
+            case TYPE_SPECIAL_NUM:
+            case TYPE_NUMBERED_NUM:
+                // Process numeric message
+                break;
+                
+            case TYPE_TONE:
+                // Process tone-only message
+                break;
+                
+            case TYPE_SHORT_INSTR:
+                // Process short instruction
+                break;
+                
+            case TYPE_BINARY:
+                // Process binary data
+                break;
+                
+            case TYPE_SECURE:
+                // Process secure message
+                break;
+        }
+        
+        // Skip next word if this was a long address
+        if (long_address) {
+            addr_pos++;
+        }
+    }
+}
+
+void FlexProcessor::process_bch_block(uint32_t* block, size_t count) {
+    // Apply BCH error correction to each word in the block
+    for (size_t i = 0; i < count; i++) {
+        block[i] = bch_correct(block[i]);
+    }
+}
+
+uint32_t FlexProcessor::bch_check(uint32_t codeword) {
+    // Check the codeword using BCH error detection
+    // Returns syndrome, which will be 0 if no errors
+    uint32_t data = codeword >> 11;    // Upper 21 bits
+    uint32_t check = codeword & 0x7FF; // Lower 11 bits
+    
+    uint32_t syndrome = 0;
+    uint32_t temp = data;
+    
+    // Calculate syndrome
+    for (int i = 0; i < 21; i++) {
+        if (temp & 1) {
+            syndrome ^= (0x7FF >> i);
+        }
+        temp >>= 1;
+    }
+    
+    return syndrome ^ check;
+}
+
+uint32_t FlexProcessor::bch_correct(uint32_t codeword) {
+    // Perform BCH error correction on the codeword
+    // Returns corrected codeword, or original if uncorrectable
+    
+    uint32_t syndrome = bch_check(codeword);
+    
+    if (syndrome == 0) {
+        // No errors detected
+        return codeword;
+    }
+    
+    // Simple single-bit error correction
+    // For a full BCH implementation, a more complex algorithm is needed
+    for (int i = 0; i < 32; i++) {
+        uint32_t bit_pattern = static_cast<uint32_t>(1) << i;
+        if (syndrome == bit_pattern) {
+            // Single bit error at position i
+            return codeword ^ bit_pattern;
+        }
+    }
+    
+    // Error detected but not correctable
+    // Mark the word as bad by setting a high bit
+    return codeword | 0x80000000;
+}
+
+int FlexProcessor::count_bits(uint32_t value) {
+    // Count the number of set bits in a value
+    int count = 0;
+    while (value) {
+        count += value & 1;
+        value >>= 1;
     }
     return count;
 }
 
-}  // namespace
-
-FlexProcessor::FlexProcessor()
-    : BasebandProcessor(),
-      state(State::Idle),
-      sync_buffer(0),
-      frame_buffer(),
-      current_word(0),
-      bit_count(0),
-      current_baud_rate(1600) {
-}
-
-void FlexAudioNormalizer::execute_in_place(const buffer_f32_t& audio) {
-    if (counter_ >= 24'000) {
-        max_ *= 0.9f;
-        min_ *= 0.9f;
-        counter_ = 0;
-        calculate_thresholds();
+uint32_t FlexProcessor::reverse_bits(uint32_t value, int num_bits) {
+    // Reverse the bits in a value
+    uint32_t result = 0;
+    for (int i = 0; i < num_bits; i++) {
+        result = (result << 1) | (value & 1);
+        value >>= 1;
     }
-
-    counter_ += audio.count;
-
-    for (size_t i = 0; i < audio.count; ++i) {
-        auto& val = audio.p[i];
-
-        if (val > max_) {
-            max_ = val;
-            calculate_thresholds();
-        }
-        if (val < min_) {
-            min_ = val;
-            calculate_thresholds();
-        }
-
-        if (val >= t_high_)
-            val = 1.0f;
-        else if (val >= t_mid_high_)
-            val = 0.33f;
-        else if (val <= t_low_)
-            val = -1.0f;
-        else if (val <= t_mid_low_)
-            val = -0.33f;
-        else
-            val = 0.0f;
-    }
+    return result;
 }
 
-void FlexAudioNormalizer::calculate_thresholds() {
-    auto center = (max_ + min_) / 2.0f;
-    auto range = (max_ - min_) / 2.0f;
-    auto step = range / 3.0f;
-
-    t_high_ = center + step * 1.5f;
-    t_mid_high_ = center + step * 0.5f;
-    t_mid_low_ = center - step * 0.5f;
-    t_low_ = center - step * 1.5f;
-}
-
-void FlexBitQueue::push(uint8_t symbol) {
-    data_ = (data_ << 2) | (symbol & 0x3);
-    if (count_ < max_size_) ++count_;
-}
-
-bool FlexBitQueue::pop(uint8_t& symbol) {
-    if (count_ == 0) return false;
-
-    --count_;
-    symbol = (data_ >> (count_ * 2)) & 0x3;
-    return true;
-}
-
-void FlexBitQueue::reset() {
-    data_ = 0;
-    count_ = 0;
-}
-
-uint8_t FlexBitQueue::size() const {
-    return count_;
-}
-
-uint32_t FlexBitQueue::data() const {
-    return data_;
-}
-
-void FlexBitExtractor::extract_bits(const buffer_f32_t& audio) {
-    for (size_t i = 0; i < audio.count; ++i) {
-        auto sample = audio.p[i];
-
-        if (current_rate_) {
-            if (current_rate_->handle_sample(sample)) {
-                uint8_t symbol;
-                if (sample >= 0.66f)
-                    symbol = 0x0;
-                else if (sample >= 0.0f)
-                    symbol = 0x1;
-                else if (sample >= -0.66f)
-                    symbol = 0x2;
-                else
-                    symbol = 0x3;
-                bits_.push(symbol);
-            }
-        } else {
-            for (auto& rate : known_rates_) {
-                if (rate.handle_sample(sample) &&
-                    diff_bit_count(rate.bits.data(), sync1_pattern) <= 4) {
-                    rate.is_stable = true;
-                    current_rate_ = &rate;
-                }
-            }
-        }
-    }
-}
-
-void FlexBitExtractor::configure(uint32_t sample_rate) {
-    sample_rate_ = sample_rate;
-    for (auto& rate : known_rates_) {
-        rate.sample_interval = sample_rate / static_cast<float>(rate.baud_rate);
-    }
-}
-
-void FlexBitExtractor::reset() {
-    current_rate_ = nullptr;
-    for (auto& rate : known_rates_)
-        rate.reset();
-}
-
-uint16_t FlexBitExtractor::baud_rate() const {
-    return current_rate_ ? current_rate_->baud_rate : 0;
-}
-
-bool FlexBitExtractor::RateInfo::handle_sample(float sample) {
-    samples_until_next -= 1;
-    if (samples_until_next > 0) return false;
-
-    bool bit_pushed = false;
-    float delta = std::abs(sample - prev_value);
-
-    switch (state) {
-        case State::WaitForSample:
-            state = State::ReadyToSend;
-            break;
-
-        case State::ReadyToSend:
-            if (!is_stable && delta > 0.33f) {
-                samples_until_next += (sample_interval / 8.0f);
-            } else {
-                state = State::WaitForSample;
-                bit_pushed = true;
-                bits.push(sample >= 0.0f ? (sample >= 0.66f ? 0x0 : 0x1) : (sample >= -0.66f ? 0x2 : 0x3));
-            }
-            break;
-    }
-
-    samples_until_next += sample_interval;
-    prev_value = sample;
-    return bit_pushed;
-}
-
-void FlexBitExtractor::RateInfo::reset() {
-    state = State::WaitForSample;
-    samples_until_next = 0.0f;
-    prev_value = 0.0f;
-    is_stable = false;
-    bits.reset();
-}
-
-void FlexCodewordExtractor::process_bits() {
-    uint8_t symbol;
-    while (bits_.pop(symbol)) {
-        data_ = (data_ << 2) | symbol;
-        bit_count_ += 2;
-
-        if (bit_count_ >= data_bit_count) {
-            if (!has_sync_) {
-                if (diff_bit_count(data_, sync1_codeword) <= 4) {
-                    handle_sync();
-                }
-            } else {
-                save_current_codeword();
-            }
-        }
-    }
-}
-
-void FlexCodewordExtractor::flush() {
-    if (word_count_ == 0) return;
-    pad_idle();
-    handle_batch_complete();
-}
-
-void FlexCodewordExtractor::reset() {
-    clear_data_bits();
-    has_sync_ = false;
-    word_count_ = 0;
-}
-
-void FlexCodewordExtractor::clear_data_bits() {
-    data_ = 0;
-    bit_count_ = 0;
-}
-
-void FlexCodewordExtractor::take_one_symbol() {
-    uint8_t symbol;
-    if (bits_.pop(symbol)) {
-        data_ = (data_ << 2) | symbol;
-        if (bit_count_ < data_bit_count)
-            bit_count_ += 2;
-    }
-}
-
-void FlexCodewordExtractor::handle_sync() {
-    clear_data_bits();
-    has_sync_ = true;
-    word_count_ = 0;
-}
-
-void FlexCodewordExtractor::save_current_codeword() {
-    batch_[word_count_++] = data_;
-    clear_data_bits();
-
-    if (word_count_ >= flex_batch_size) {
-        handle_batch_complete();
-    }
-}
-
-void FlexCodewordExtractor::handle_batch_complete() {
-    on_batch_(*this);
-    has_sync_ = false;
-    word_count_ = 0;
-}
-
-void FlexCodewordExtractor::pad_idle() {
-    while (word_count_ < flex_batch_size) {
-        batch_[word_count_++] = 0xAAAAAAAA;
-    }
-}
-
-void FlexProcessor::execute(const buffer_c8_t& buffer) {
-    if (!configured) return;
-
-    const auto decim_0_out = decim_0.execute(buffer, dst_buffer);
-    const auto decim_1_out = decim_1.execute(decim_0_out, dst_buffer);
-    const auto channel_out = channel_filter.execute(decim_1_out, dst_buffer);
-    auto audio = demod.execute(channel_out, audio_buffer);
-
-    squelch.set_threshold(0.01);
-    squelch_history = (squelch_history << 1) | (squelch.execute(audio) ? 1 : 0);
-
-    lpf.execute_in_place(audio);
-    normalizer.execute_in_place(audio);
-    audio_output.write(audio);
-
-    bit_extractor.extract_bits(audio);
-    word_extractor.process_bits();
-
-    static uint64_t sync_buffer64 = 0;
-    static uint32_t block_buffer[8] = {0};
-    static uint8_t word_count = 0;
-    static uint8_t bit_count = 0;
-
-    for (size_t i = 0; i < audio.count; ++i) {
-        float sample = audio.p[i];
-
-        sync_buffer64 = (sync_buffer64 << 2);
-        if (sample >= 0.66f)
-            sync_buffer64 |= 0x0;
-        else if (sample >= 0.0f)
-            sync_buffer64 |= 0x1;
-        else if (sample >= -0.66f)
-            sync_buffer64 |= 0x2;
-        else
-            sync_buffer64 |= 0x3;
-
-        switch (state) {
-            case State::Idle:
-                if (squelch.execute(audio)) {
-                    uint32_t sync1 = (sync_buffer64 >> 32) & 0xFFFF;
-                    uint32_t sync2 = sync_buffer64 & 0xFFFF;
-                    if (diff_bit_count(sync1, 0xA6C6) <= 2 && diff_bit_count(sync2, 0xAAAA) <= 2) {
-                        uint32_t sync_pre = (sync_buffer64 >> 48) & 0xFFFF;
-                        uint32_t sync_post = (sync_buffer64 >> 16) & 0xFFFF;
-                        if (diff_bit_count(sync_pre, 0x870C) <= 2 && diff_bit_count(sync_post, 0x78F3) <= 2) {
-                            current_baud_rate = 1600;
-                            state = State::FrameData;
-                            word_count = 0;
-                            bit_count = 0;
-                        } else if (diff_bit_count(sync_pre, 0xB068) <= 2 && diff_bit_count(sync_post, 0x4F97) <= 2) {
-                            current_baud_rate = 3200;
-                            state = State::FrameData;
-                            word_count = 0;
-                            bit_count = 0;
-                        } else if (diff_bit_count(sync_pre, 0xDEA0) <= 2 && diff_bit_count(sync_post, 0x215F) <= 2) {
-                            current_baud_rate = 6400;
-                            state = State::FrameData;
-                            word_count = 0;
-                            bit_count = 0;
-                        }
-                    }
-                }
-                break;
-
-            case State::FrameData:
-                block_buffer[word_count] = (block_buffer[word_count] << 2);
-                if (sample >= 0.66f)
-                    block_buffer[word_count] |= 0x0;
-                else if (sample >= 0.0f)
-                    block_buffer[word_count] |= 0x1;
-                else if (sample >= -0.66f)
-                    block_buffer[word_count] |= 0x2;
-                else
-                    block_buffer[word_count] |= 0x3;
-
-                bit_count += 2;
-
-                if (bit_count >= 32) {
-                    word_count++;
-                    bit_count = 0;
-                    if (word_count >= 8) {
-                        packet.set_flag(FlexPacketFlag::FLEX_NORMAL);
-                        packet.set_timestamp(Timestamp::now());
-                        packet.set_bitrate(current_baud_rate);
-                        flex_batch_t batch{};
-                        for (size_t j = 0; j < 8; j++) {
-                            batch[j] = block_buffer[j];
-                        }
-                        packet.set(batch);
-                        FlexPacketMessage message(packet);
-                        shared_memory.application_queue.push(message);
-                        word_count = 0;
-                        state = State::Idle;  // Reset to find next sync
-                    }
-                }
-                break;
-
-            default:
-                state = State::Idle;
-                break;
-        }
-    }
-
-    samples_processed += buffer.count;
-    if (samples_processed >= stat_update_threshold) {
-        send_stats();
-        samples_processed -= stat_update_threshold;
-    }
-}
-
-void FlexProcessor::process_frame() {
-    // No longer used; packet sent directly in execute()
-}
-
-void FlexProcessor::on_message(const Message* const message) {
-    switch (message->id) {
-        case Message::ID::FlexConfigure:
-            configure();
-            break;
-
-        case Message::ID::NBFMConfigure:
-            squelch.set_threshold(0.01);
-            break;
-
-        case Message::ID::AudioBeep:
-            on_beep_message(*reinterpret_cast<const AudioBeepMessage*>(message));
-            break;
-
-        default:
-            break;
-    }
-}
-
-void FlexProcessor::configure() {
-    constexpr size_t decim_0_output_fs = baseband_fs / decim_0.decimation_factor;
-    constexpr size_t decim_1_output_fs = decim_0_output_fs / decim_1.decimation_factor;
-    constexpr size_t channel_filter_output_fs = decim_1_output_fs / 2;
-    constexpr size_t demod_input_fs = channel_filter_output_fs;
-
-    decim_0.configure(taps_200k_decim_0.taps);
-    decim_1.configure(taps_16k0_decim_1.taps);
-    channel_filter.configure(taps_16k0_channel.taps, 2);
-
-    demod.configure(demod_input_fs, 4800);
-
-    audio_output.configure(false);
-    bit_extractor.configure(demod_input_fs);
-
-    configured = true;
-}
-
-void FlexProcessor::flush() {
-    word_extractor.flush();
-}
-
-void FlexProcessor::reset() {
-    state = State::Idle;
-    sync_buffer = 0;
-    frame_buffer.clear();
-    current_word = 0;
-    bit_count = 0;
-
-    bits.reset();
-    bit_extractor.reset();
-    word_extractor.reset();
-    samples_processed = 0;
-}
-
-void FlexProcessor::send_stats() const {
-    FlexStatsMessage message(
-        current_word,
-        frame_buffer.size(),
-        state != State::Idle,
-        current_baud_rate);
+void FlexProcessor::send_status_update() {
+    // Send status message to the UI
+    FlexStatsMessage message{bits_processed, frames_processed, sync_found, baud_rate};
     shared_memory.application_queue.push(message);
 }
 
 void FlexProcessor::send_packet() {
-    packet.set_flag(FlexPacketFlag::FLEX_NORMAL);
-    packet.set_timestamp(Timestamp::now());
-    packet.set_bitrate(bit_extractor.baud_rate());
-    packet.set(word_extractor.batch());
-
-    FlexPacketMessage message(packet);
+    // Create and send a FLEX packet to the UI
+    FlexPacket packet;
+    packet.set(batch);
+    packet.set_timestamp(timestamp);
+    packet.set_bitrate(baud_rate);
+    
+    // Set flags based on status
+    packet.set_flag(FLEX_NORMAL);
+    
+    // Send packet message
+    FlexPacketMessage message{packet};
     shared_memory.application_queue.push(message);
 }
 
-void FlexProcessor::on_beep_message(const AudioBeepMessage& message) {
-    audio::dma::beep_start(message.freq, message.sample_rate, message.duration_ms);
+void FlexProcessor::reset() {
+    // Reset the FLEX decoder state
+    sync_found = false;
+    batch_index = 0;
+    bit_counter = 0;
+    bits_processed = 0;
+    frames_processed = 0;
+    phase = 0;
+    
+    // Clear batch buffer
+    for (size_t i = 0; i < batch.size(); i++) {
+        batch[i] = 0;
+    }
+    
+    // Clear sync buffer
+    for (int i = 0; i < 4; i++) {
+        sync_buffer[i] = 0;
+    }
+    
+    // Reset delay line
+    delay_line_index = 0;
+    prev_mixed = 0;
+    prev_filtered = 0;
+    
+    // Send status update
+    send_status_update();
+}
+
+void FlexProcessor::on_message(const Message* const message) {
+    if (message->id == Message::ID::FlexConfigure)
+        configure(*reinterpret_cast<const FlexConfigureMessage*>(message));
+}
+
+void FlexProcessor::configure(const FlexConfigureMessage& message) {
+    (void)message; // Prevent unused parameter warning
+    
+    // Configure the DSP chain for NFM with appropriate bandwidth for FLEX
+    // Using 16kHz filter which is better for FLEX pager signals
+    decim_0.configure(taps_16k0_decim_0.taps);
+    decim_1.configure(taps_16k0_decim_1.taps);
+    channel_filter.configure(taps_16k0_channel.taps, 2);
+    
+    // Configure FM demodulator with appropriate deviation for FLEX
+    // FLEX typically uses +/-4.8kHz deviation
+    demod.configure(audio_fs, 5000);
+
+    // Configure audio output with appropriate filtering
+    audio_output.configure(audio_24k_hpf_300hz_config, audio_24k_deemph_300_6_config, 0);
+    
+    // Reset the decoder state
+    reset();
+    
+    configured = true;
+    
+    // Send initial status update
+    send_status_update();
 }
 
 int main() {
     audio::dma::init_audio_out();
+
     EventDispatcher event_dispatcher{std::make_unique<FlexProcessor>()};
     event_dispatcher.run();
     return 0;
