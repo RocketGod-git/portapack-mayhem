@@ -195,15 +195,18 @@ void FrameExtractor::process_bits() {
             continue;
 
         if (!has_sync_) {
-            if (diff_bit_count(data_, sync_codeword) <= 2)
+            if (diff_bit_count(data_, sync_codeword) <= 2) {
                 handle_sync(false);
-            else if (diff_bit_count(data_, ~sync_codeword) <= 2)
+            } else if (diff_bit_count(data_, ~sync_codeword) <= 2) {
                 handle_sync(true);
-            else if (diff_bit_count(data_, eot_codeword) <= 2) {
+            } else if (diff_bit_count(data_, eot_codeword) <= 2) {
                 reset();
                 return;
+            } else {
+                sync_fail_count_++;
+                clear_data_bits();
+                continue;
             }
-            continue;
         }
 
         if (block_bit_index_ < 256) {
@@ -233,6 +236,7 @@ void FrameExtractor::reset() {
     word_count_ = 0;
     block_count_ = 0;
     block_bit_index_ = 0;
+    sync_fail_count_ = 0;
 }
 
 void FrameExtractor::clear_data_bits() {
@@ -253,6 +257,7 @@ void FrameExtractor::handle_sync(bool inverted) {
     word_count_ = 0;
     block_count_ = 0;
     block_bit_index_ = 0;
+    sync_fail_count_ = 0;
 }
 
 void FrameExtractor::save_current_word() {
@@ -266,6 +271,7 @@ void FrameExtractor::handle_frame_complete() {
     word_count_ = 0;
     block_count_ = 0;
     block_bit_index_ = 0;
+    sync_fail_count_ = 0;
 }
 
 void FrameExtractor::process_block() {
@@ -293,6 +299,23 @@ void FlexProcessor::execute(const buffer_c8_t& buffer) {
     const auto channel_out = channel_filter.execute(decim_1_out, dst_buffer);
     auto audio = demod.execute(channel_out, audio_buffer);
 
+    bool has_audio = squelch.execute(audio);
+    squelch_history = (squelch_history << 1) | (has_audio ? 1 : 0);
+
+    if (squelch_history == 0) {
+        if (frame_extractor.current() > 0) {
+            flush();
+            reset();
+            send_stats();
+        }
+
+        for (size_t i = 0; i < audio.count; ++i)
+            audio.p[i] = 0.0;
+
+        audio_output.write(audio);
+        return;
+    }
+
     normalizer.execute_in_place(audio);
     audio_output.write(audio);
 
@@ -300,6 +323,16 @@ void FlexProcessor::execute(const buffer_c8_t& buffer) {
     frame_extractor.process_bits();
 
     samples_processed += buffer.count;
+    sync_samples_processed += buffer.count;
+
+    if (sync_samples_processed >= sync_timeout_threshold && frame_extractor.has_sync()) {
+        if (frame_extractor.count() == 0) {
+            reset();
+            send_stats();
+        }
+        sync_samples_processed = 0;
+    }
+
     if (samples_processed >= stat_update_threshold) {
         send_stats();
         samples_processed -= stat_update_threshold;
@@ -311,6 +344,12 @@ void FlexProcessor::on_message(const Message* const message) {
         case Message::ID::FlexConfigure:
             configure();
             break;
+
+        case Message::ID::NBFMConfigure: {
+            auto config = reinterpret_cast<const NBFMConfigureMessage*>(message);
+            squelch.set_threshold(config->squelch_level / 99.0);
+            break;
+        }
 
         case Message::ID::AudioBeep:
             on_beep_message(*reinterpret_cast<const AudioBeepMessage*>(message));
@@ -335,6 +374,7 @@ void FlexProcessor::configure() {
     audio_output.configure(false);
 
     bit_extractor.configure(demod_input_fs);
+    squelch.set_threshold(0.5); // Default threshold, adjustable via NBFMConfigure
 
     configured = true;
 }
@@ -348,6 +388,8 @@ void FlexProcessor::reset() {
     bit_extractor.reset();
     frame_extractor.reset();
     samples_processed = 0;
+    sync_samples_processed = 0;
+    squelch_history = 0;
 }
 
 void FlexProcessor::send_stats() const {
@@ -365,6 +407,8 @@ void FlexProcessor::send_packet() {
 
     FlexPacketMessage message(packet);
     shared_memory.application_queue.push(message);
+
+    sync_samples_processed = 0; // Reset sync timeout on valid packet
 }
 
 void FlexProcessor::on_beep_message(const AudioBeepMessage& message) {

@@ -6,6 +6,7 @@
 #include "baseband_thread.hpp"
 #include "dsp_decimate.hpp"
 #include "dsp_demodulate.hpp"
+#include "dsp_squelch.hpp"
 #include "message.hpp"
 #include "portapack_shared_memory.hpp"
 #include "rssi_thread.hpp"
@@ -127,6 +128,7 @@ private:
     batch_t batch_{};
     std::array<char, 256> block_buffer_{};
     uint16_t block_bit_index_ = 0;
+    uint32_t sync_fail_count_ = 0; // Track failed sync attempts
 };
 
 class FlexProcessor : public BasebandProcessor {
@@ -139,6 +141,7 @@ private:
     static constexpr uint8_t stat_update_interval = 10;
     static constexpr uint32_t stat_update_threshold =
         baseband_fs / stat_update_interval;
+    static constexpr uint32_t sync_timeout_threshold = baseband_fs * 2; // 2 seconds
 
     void configure();
     void flush();
@@ -162,10 +165,13 @@ private:
 
     AudioNormalizer normalizer{};
     AudioOutput audio_output{};
+    FMSquelch squelch{};
+    uint64_t squelch_history = 0;
 
     FlexPacket packet{};
 
     uint32_t samples_processed = 0;
+    uint32_t sync_samples_processed = 0; // Track samples since last sync
 
     BitQueue bits{};
     BitExtractor bit_extractor{bits};
