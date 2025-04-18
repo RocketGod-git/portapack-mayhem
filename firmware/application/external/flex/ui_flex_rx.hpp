@@ -1,11 +1,3 @@
-/*
- * ------------------------------------------------------------
- * |  Made by RocketGod                                       |
- * |  Find me at https://betaskynet.com                       |
- * |  Argh matey!                                             |
- * ------------------------------------------------------------
- */
-
 #ifndef __UI_FLEX_RX_H__
 #define __UI_FLEX_RX_H__
 
@@ -22,49 +14,40 @@
 namespace ui::external_app::flex_rx {
 
 class FlexLogger {
-   public:
+public:
     Optional<File::Error> append(const std::filesystem::path& filename) {
         return log_file.append(filename);
     }
     
-    void log_decoded(const Timestamp& timestamp, const std::string& data) {
-        // Just write the data directly to the log file
+    void log_decoded(const rtc::RTC& timestamp, const std::string& data) {
         log_file.write_entry(timestamp, data);
     }
 
-   private:
+private:
     LogFile log_file{};
 };
 
 class FlexRxView : public View {
-   public:
+public:
     FlexRxView(NavigationView& nav);
     ~FlexRxView();
     void focus() override;
     std::string title() const override { return "Flex RX"; };
 
-   private:
+private:
     void on_packet(const FlexPacketMessage& message);
     void on_stats(const FlexStatsMessage& stats);
     void on_freqchg(int64_t freq);
-    void on_manual_freq_change(int64_t freq);
 
     NavigationView& nav_;
     RxRadioState radio_state_{};
     app_settings::SettingsManager settings_{"rx_flex", app_settings::Mode::RX};
-    uint8_t console_color{0};
     bool logging{false};
-    std::string current_message{};
-    uint32_t last_address{0};
 
     uint16_t last_baud_rate{0};
     bool last_has_sync{false};
     uint8_t last_frames{0};
     uint32_t last_bits{0};
-
-    uint32_t check_bch_checksum(uint32_t codeword);
-    std::string get_message_type_name(uint8_t type);
-    std::string to_string_hex(uint32_t value, int width);
 
     RFAmpField field_rf_amp{{13 * 8, 0 * 16}};
     LNAGainField field_lna{{15 * 8, 0 * 16}};
