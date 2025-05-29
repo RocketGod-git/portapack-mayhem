@@ -115,10 +115,10 @@ class JammerView : public View {
 
     JammerChannel* jammer_channels = (JammerChannel*)shared_memory.bb_data.data;
     bool jamming{false};
-    bool cooling{false};     // euquiq: Indicates jammer in cooldown
-    uint16_t seconds = 0;    // euquiq: seconds counter for toggling tx / cooldown
-    int16_t mscounter = 0;   // euquiq: Internal ms counter for do_timer()
-    lfsr_word_t lfsr_v = 1;  // euquiq: Used to generate "random" Jitter
+    bool cooling{false};
+    uint16_t seconds = 0;
+    int16_t mscounter = 0;
+    lfsr_word_t lfsr_v = 1;
 
     const Style& style_val = *Theme::getInstance()->fg_green;
     const Style& style_cancel = *Theme::getInstance()->fg_red;
@@ -140,11 +140,13 @@ class JammerView : public View {
         {{1 * 8, 25 * 8}, "Speed:", Theme::getInstance()->fg_light->foreground},
         {{3 * 8, 27 * 8}, "Hop:", Theme::getInstance()->fg_light->foreground},
         {{4 * 8, 29 * 8}, "TX:", Theme::getInstance()->fg_light->foreground},
-        {{1 * 8, 31 * 8}, "Sle3p:", Theme::getInstance()->fg_light->foreground},   // euquiq: Token of appreciation to TheSle3p, which made this ehnancement a reality with his bounty.
-        {{0 * 8, 33 * 8}, "Jitter:", Theme::getInstance()->fg_light->foreground},  // Maybe the repository curator can keep the "mystype" for some versions.
+        {{1 * 8, 31 * 8}, "Sle3p:", Theme::getInstance()->fg_light->foreground},
+        {{0 * 8, 33 * 8}, "Jitter:", Theme::getInstance()->fg_light->foreground},
+        {{0 * 8, 37 * 8}, "Wv Freq:", Theme::getInstance()->fg_light->foreground},
         {{11 * 8, 29 * 8}, "Secs.", Theme::getInstance()->fg_light->foreground},
         {{11 * 8, 31 * 8}, "Secs.", Theme::getInstance()->fg_light->foreground},
         {{11 * 8, 33 * 8}, "/60", Theme::getInstance()->fg_light->foreground},
+        {{11 * 8, 37 * 8}, "Hz", Theme::getInstance()->fg_light->foreground},
         {{2 * 8, 35 * 8}, "Gain:", Theme::getInstance()->fg_light->foreground},
         {{11 * 8, 35 * 8}, "A:", Theme::getInstance()->fg_light->foreground}};
 
@@ -182,7 +184,8 @@ class JammerView : public View {
     OptionsField options_hop{
         {7 * 8, 27 * 8},
         5,
-        {{"10ms ", 1},
+        {{"Off   ", 0},
+         {"10ms ", 1},
          {"50ms ", 5},
          {"100ms", 10},
          {"1s   ", 100},
@@ -201,7 +204,7 @@ class JammerView : public View {
     NumberField field_timepause{
         {8 * 8, 31 * 8},
         2,
-        {1, 60},
+        {0, 60},  // Allow 0 for off
         1,
         ' ',
     };
@@ -209,7 +212,7 @@ class JammerView : public View {
     NumberField field_jitter{
         {8 * 8, 33 * 8},
         2,
-        {1, 60},
+        {0, 60},  // Allow 0 for off
         1,
         ' ',
     };
@@ -227,6 +230,14 @@ class JammerView : public View {
         1,
         {0, 1},
         1,
+        ' ',
+    };
+
+    NumberField field_waveform_freq{
+        {8 * 8, 37 * 8},
+        5,
+        {100, 50000},  // 100 Hz to 50 kHz
+        100,
         ' ',
     };
 

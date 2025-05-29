@@ -1177,16 +1177,19 @@ class JammerConfigureMessage : public Message {
     constexpr JammerConfigureMessage(
         const bool run,
         const jammer::JammerType type,
-        const uint32_t speed)
+        const uint32_t speed,
+        const uint32_t waveform_freq)
         : Message{ID::JammerConfigure},
           run(run),
           type(type),
-          speed(speed) {
+          speed(speed),
+          waveform_freq(waveform_freq) {
     }
 
     const bool run;
     const jammer::JammerType type;
     const uint32_t speed;
+    const uint32_t waveform_freq;
 };
 
 class DTMFTXConfigMessage : public Message {

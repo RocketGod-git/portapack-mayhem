@@ -115,11 +115,11 @@ void HopperView::start_tx() {
 
         transmitter_model.set_rf_amp(field_amp.value());
         transmitter_model.set_tx_gain(field_gain.value());
-        transmitter_model.set_baseband_bandwidth(28'000'000);  // Although tx is narrowband , let's use Max TX LPF .
+        transmitter_model.set_baseband_bandwidth(28'000'000);
         transmitter_model.enable();
 
-        baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value());
-        mscounter = 0;  // euquiq: Reset internal ms counter for do_timer()
+        baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), 1000);
+        mscounter = 0;
     } else {
         if (out_of_ranges)
             nav_.display_modal("Error", "Jam freq too much.");
@@ -130,22 +130,21 @@ void HopperView::stop_tx() {
     button_transmit.set_style(&style_val);
     button_transmit.set_text("START");
     transmitter_model.disable();
-    baseband::set_jammer(false, JammerType::TYPE_FSK, 0);
+    baseband::set_jammer(false, JammerType::TYPE_FSK, 0, 1000);
     jamming = false;
     cooling = false;
 }
 
-// called each 1/60th of second
 void HopperView::on_timer() {
     if (++mscounter == 60) {
         mscounter = 0;
         if (jamming) {
             if (cooling) {
-                if (++seconds >= field_timepause.value()) {                // Re-start TX
-                    transmitter_model.set_baseband_bandwidth(28'000'000);  // Although tx is narrowband , let's use Max TX LPF .
+                if (++seconds >= field_timepause.value()) {
+                    transmitter_model.set_baseband_bandwidth(28'000'000);
                     transmitter_model.enable();
                     button_transmit.set_text("STOP");
-                    baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value());
+                    baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), 1000);
 
                     int32_t jitter_amount = field_jitter.value();
                     if (jitter_amount) {
@@ -158,11 +157,10 @@ void HopperView::on_timer() {
                     seconds = 0;
                 }
             } else {
-                if (++seconds >= field_timetx.value())  // Start cooling period:
-                {
+                if (++seconds >= field_timetx.value()) {
                     transmitter_model.disable();
                     button_transmit.set_text("PAUSED");
-                    baseband::set_jammer(false, JammerType::TYPE_FSK, 0);
+                    baseband::set_jammer(false, JammerType::TYPE_FSK, 0, 1000);
 
                     int32_t jitter_amount = field_jitter.value();
                     if (jitter_amount) {
@@ -250,7 +248,6 @@ void HopperView::save_list() {
 HopperView::HopperView(
     NavigationView& nav)
     : nav_{nav} {
-    // baseband::run_image(portapack::spi_flash::image_tag_jammer);
     baseband::run_prepared_image(portapack::memory::map::m4_code.base());
 
     add_children({&menu_freq_list,
@@ -272,9 +269,9 @@ HopperView::HopperView(
                   &field_amp,
                   &button_transmit});
 
-    options_type.set_selected_index(3);   // Rand CW
-    options_speed.set_selected_index(3);  // 10kHz
-    options_hop.set_selected_index(1);    // 50ms
+    options_type.set_selected_index(3);
+    options_speed.set_selected_index(3);
+    options_hop.set_selected_index(1);
     button_transmit.set_style(&style_val);
 
     field_timetx.set_value(30);
@@ -294,7 +291,6 @@ HopperView::HopperView(
                 freq_list.push_back(freq);
                 update_freq_list_menu_view();
             };
-
         } else {
             nav_.display_modal("Err", "No more.");
         }
@@ -315,13 +311,11 @@ HopperView::HopperView(
     };
 
     button_clear.on_select = [this]() {
-        // clang-format off
         nav_.display_modal("Del:", "Clean all?\n", YESNO, [this](bool choice) {
-                if (choice){
-                    freq_list.clear();
-                    update_freq_list_menu_view(); 
-        } }, TRUE);
-        // clang-format on
+             if (choice) {
+                 freq_list.clear();
+                 update_freq_list_menu_view();
+             } }, TRUE);
 
         update_freq_list_menu_view();
     };

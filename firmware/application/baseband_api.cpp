@@ -297,11 +297,12 @@ void set_adsb() {
     send_message(&message);
 }
 
-void set_jammer(const bool run, const jammer::JammerType type, const uint32_t speed) {
+void set_jammer(const bool run, const jammer::JammerType type, const uint32_t speed, const uint32_t waveform_freq) {
     const JammerConfigureMessage message{
         run,
         type,
-        speed};
+        speed,
+        waveform_freq};
     send_message(&message);
 }
 

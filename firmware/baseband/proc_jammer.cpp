@@ -38,19 +38,25 @@ void JammerProcessor::execute(const buffer_c8_t& buffer) {
     if (!configured) return;
 
     for (size_t i = 0; i < buffer.count; i++) {
-        if (!jammer_duration) {
+        if (jammer_duration != 0xFFFFFFFF && !jammer_duration) {
+            uint32_t start_range = current_range;
+            uint32_t old_wave_phase = wave_phase;
             do {
                 current_range++;
                 if (current_range == JAMMER_MAX_CH) current_range = 0;
+                if (current_range == start_range) {
+                    configured = false;
+                    return;
+                }
             } while (!jammer_channels[current_range].enabled);
 
             jammer_duration = jammer_channels[current_range].duration;
             jammer_bw = jammer_channels[current_range].width / 2;
-
             message.freq = jammer_channels[current_range].center;
             message.range = current_range;
             shared_memory.application_queue.push(message);
-        } else {
+            wave_phase = old_wave_phase;  // Preserve phase for continuity
+        } else if (jammer_duration != 0xFFFFFFFF) {
             jammer_duration--;
         }
 
@@ -66,27 +72,50 @@ void JammerProcessor::execute(const buffer_c8_t& buffer) {
             } else if (noise_type == jammer::JammerType::TYPE_RANDOM) {
                 sample = lfsr & 0xFF;
             } else if (noise_type == jammer::JammerType::TYPE_SINE) {
-                wave_phase += 0x01000000;
+                uint32_t phase_increment = (waveform_freq * (1ULL << 32)) / 3072000;
+                wave_phase += phase_increment;
                 sample = sine_table_i8[(wave_phase >> 24) & 0xFF];
             } else if (noise_type == jammer::JammerType::TYPE_SQUARE) {
-                wave_index = (wave_index + 1) % 2;
+                static uint32_t square_counter = 0;
+                uint32_t square_period = 3072000 / (2 * waveform_freq);
+                square_counter++;
+                if (square_counter >= square_period) {
+                    square_counter = 0;
+                    wave_index = (wave_index + 1) % 2;
+                }
                 sample = wave_index ? 127 : -128;
             } else if (noise_type == jammer::JammerType::TYPE_SAWTOOTH) {
-                wave_index = (wave_index + 1) % 256;
-                sample = (wave_index * 127) / 255 - 128;
+                static uint32_t saw_counter = 0;
+                uint32_t saw_period = 3072000 / waveform_freq;
+                saw_counter++;
+                if (saw_counter >= saw_period) {
+                    saw_counter = 0;
+                    wave_index = (wave_index + 1) % 256;
+                }
+                sample = -128 + (wave_index * 255) / 256;
             } else if (noise_type == jammer::JammerType::TYPE_TRIANGLE) {
-                wave_index = (wave_index + 1) % 256;
-                sample = (wave_index < 128 ? wave_index : (255 - wave_index)) * 127 / 127 - 128;
+                static uint32_t tri_counter = 0;
+                uint32_t tri_period = 3072000 / waveform_freq;
+                tri_counter++;
+                if (tri_counter >= tri_period) {
+                    tri_counter = 0;
+                    wave_index = (wave_index + 1) % 256;
+                }
+                sample = (wave_index < 128 ? wave_index * 2 : (255 - wave_index) * 2) - 128;
             } else if (noise_type == jammer::JammerType::TYPE_CHIRP) {
                 chirp_freq += 0.01f;
                 if (chirp_freq > 1.0f) chirp_freq = 0.0f;
-                wave_phase += static_cast<uint32_t>(0x01000000 * (1.0f + chirp_freq));
+                uint32_t base_freq = waveform_freq;
+                uint32_t max_freq = waveform_freq * 2;
+                uint32_t chirp_freq_scaled = base_freq + (chirp_freq * (max_freq - base_freq));
+                wave_phase += (chirp_freq_scaled * (1ULL << 32)) / 3072000;
                 sample = sine_table_i8[(wave_phase >> 24) & 0xFF];
             } else if (noise_type == jammer::JammerType::TYPE_GAUSSIAN) {
                 float u1 = static_cast<float>(lfsr & 0xFFFF) / 0x10000;
                 float u2 = static_cast<float>((lfsr >> 16) & 0xFFFF) / 0x10000;
+                if (u1 == 0.0f) u1 = 1e-10f;  // Avoid log(0)
                 float gaussian = std::sqrt(-2.0f * std::log(u1)) * std::cos(2 * M_PI * u2);
-                sample = static_cast<int8_t>(gaussian * 32);
+                sample = static_cast<int8_t>(std::max(-127.0f, std::min(127.0f, gaussian * 127.0f)));
             } else if (noise_type == jammer::JammerType::TYPE_BRUTEFORCE) {
                 sample = 127;
             }
@@ -104,13 +133,10 @@ void JammerProcessor::execute(const buffer_c8_t& buffer) {
         }
 
         delta = sample * jammer_bw;
-
         phase += delta;
         sphase = phase + (64 << 24);
-
         re = sine_table_i8[(sphase & 0xFF000000) >> 24];
         im = sine_table_i8[(phase & 0xFF000000) >> 24];
-
         buffer.p[i] = {re, im};
     }
 }
@@ -118,16 +144,18 @@ void JammerProcessor::execute(const buffer_c8_t& buffer) {
 void JammerProcessor::on_message(const Message* const msg) {
     if (msg->id == Message::ID::JammerConfigure) {
         const auto message = *reinterpret_cast<const JammerConfigureMessage*>(msg);
-
         if (message.run) {
             jammer_channels = (JammerChannel*)shared_memory.bb_data.data;
             noise_type = message.type;
             noise_period = 3072000 / message.speed;
+            waveform_freq = message.waveform_freq;
             if (noise_type == jammer::JammerType::TYPE_SWEEP || noise_type == jammer::JammerType::TYPE_SINE ||
                 noise_type == jammer::JammerType::TYPE_SQUARE || noise_type == jammer::JammerType::TYPE_SAWTOOTH ||
                 noise_type == jammer::JammerType::TYPE_TRIANGLE || noise_type == jammer::JammerType::TYPE_CHIRP ||
-                noise_type == jammer::JammerType::TYPE_GAUSSIAN || noise_type == jammer::JammerType::TYPE_BRUTEFORCE)
+                noise_type == jammer::JammerType::TYPE_GAUSSIAN || noise_type == jammer::JammerType::TYPE_BRUTEFORCE) {
                 noise_period >>= 8;
+                if (noise_period < 1) noise_period = 1;
+            }
             period_counter = 0;
             jammer_duration = 0;
             current_range = 0;
@@ -135,7 +163,6 @@ void JammerProcessor::on_message(const Message* const msg) {
             wave_phase = 0;
             wave_index = 0;
             chirp_freq = 0.0f;
-
             configured = true;
         } else {
             configured = false;

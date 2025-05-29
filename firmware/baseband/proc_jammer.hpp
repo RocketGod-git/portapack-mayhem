@@ -42,7 +42,6 @@ class JammerProcessor : public BasebandProcessor {
     bool configured{false};
 
     JammerChannel* jammer_channels{};
-
     JammerType noise_type{};
     uint32_t tone_delta{0}, lfsr{}, feedback{};
     uint32_t noise_period{0}, period_counter{0};
@@ -56,6 +55,7 @@ class JammerProcessor : public BasebandProcessor {
     uint32_t wave_phase{0};
     uint32_t wave_index{0};
     float chirp_freq{0.0f};
+    uint32_t waveform_freq{1000};  // Default 1 kHz
     RetuneMessage message{};
 
     BasebandThread baseband_thread{3072000, this, baseband::Direction::Transmit};
