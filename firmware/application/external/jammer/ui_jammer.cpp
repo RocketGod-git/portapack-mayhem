@@ -144,7 +144,7 @@ RangeView::RangeView(NavigationView& nav) {
         auto load_view = nav.push<FrequencyLoadView>();
         load_view->on_frequency_loaded = [this](rf::Frequency value) {
             update_center(value);
-            update_width(100000);
+            update_width(0);
         };
         load_view->on_range_loaded = [this](rf::Frequency start, rf::Frequency stop) {
             update_start(start);
@@ -198,10 +198,23 @@ void JammerView::start_tx() {
     for (size_t r = 0; r < 3; r++) {
         if (range_views[r]->frequency_range.enabled) {
             range_bw = abs(range_views[r]->frequency_range.max - range_views[r]->frequency_range.min);
-            if (range_views[r]->frequency_range.min < range_views[r]->frequency_range.max)
-                start_freq = range_views[r]->frequency_range.min;
-            else
-                start_freq = range_views[r]->frequency_range.max;
+            if (range_bw == 0) {
+                // Handle zero width with Flipper-like bandwidth
+                range_bw = 650000;  // 650 kHz, like OOK650Async
+                if (range_views[r]->frequency_range.min == range_views[r]->frequency_range.max) {
+                    start_freq = range_views[r]->frequency_range.min;
+                    range_views[r]->frequency_range.max = start_freq + range_bw;
+                } else {
+                    start_freq = range_views[r]->frequency_range.max;
+                    range_views[r]->frequency_range.min = start_freq - range_bw;
+                }
+                range_views[r]->update_width(range_bw);
+            } else {
+                if (range_views[r]->frequency_range.min < range_views[r]->frequency_range.max)
+                    start_freq = range_views[r]->frequency_range.min;
+                else
+                    start_freq = range_views[r]->frequency_range.max;
+            }
 
             if (range_bw >= JAMMER_CH_WIDTH) {
                 num_channels = 0;
@@ -243,52 +256,10 @@ void JammerView::start_tx() {
 
         transmitter_model.set_rf_amp(field_amp.value());
         transmitter_model.set_tx_gain(field_gain.value());
-        transmitter_model.set_baseband_bandwidth(28'000'000);
+        transmitter_model.set_baseband_bandwidth(650000);  // Match Flipper OOK650Async
         transmitter_model.enable();
         baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), field_waveform_freq.value());
         mscounter = 0;
-
-        // Debug: Confirm TX parameters
-        std::string type_str;
-        switch (options_type.selected_index()) {
-            case 0:
-                type_str = "Rand FSK";
-                break;
-            case 1:
-                type_str = "FM tone";
-                break;
-            case 2:
-                type_str = "CW sweep";
-                break;
-            case 3:
-                type_str = "Noise";
-                break;
-            case 4:
-                type_str = "Sine";
-                break;
-            case 5:
-                type_str = "Square";
-                break;
-            case 6:
-                type_str = "Sawtooth";
-                break;
-            case 7:
-                type_str = "Triangle";
-                break;
-            case 8:
-                type_str = "Chirp";
-                break;
-            case 9:
-                type_str = "Gauss";
-                break;
-            case 10:
-                type_str = "Brute";
-                break;
-            default:
-                type_str = "Unknown";
-                break;
-        }
-        nav_.display_modal("TX Started", "Freq: 315 MHz\nType: " + type_str + "\nGain: " + to_string_dec_uint(field_gain.value()) + "\nAmp: " + to_string_dec_uint(field_amp.value()));
     } else {
         if (out_of_ranges)
             nav_.display_modal("Error", "Jamming bandwidth too large.\nMust be less than 24MHz.");
@@ -312,7 +283,7 @@ void JammerView::on_timer() {
         if (jamming) {
             if (cooling) {
                 if (++seconds >= field_timepause.value()) {
-                    transmitter_model.set_baseband_bandwidth(28'000'000);
+                    transmitter_model.set_baseband_bandwidth(650000);
                     transmitter_model.enable();
                     button_transmit.set_text("STOP");
                     baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), field_waveform_freq.value());
@@ -371,24 +342,24 @@ JammerView::JammerView(NavigationView& nav)
     view_range_b.set_parent_rect(view_rect);
     view_range_c.set_parent_rect(view_rect);
 
-    options_type.set_selected_index(4);   // Sine for better RX detection
-    options_speed.set_selected_index(3);  // 10kHz
+    options_type.set_selected_index(4);   // Sine, like Flipper SineWave
+    options_speed.set_selected_index(3);  // 10kHz, like Flipper modulation rate
     options_hop.set_selected_index(0);    // Off
     button_transmit.set_style(&style_val);
     field_timetx.set_value(30);
     field_timepause.set_value(0);         // Off
     field_jitter.set_value(0);            // Off
-    field_waveform_freq.set_value(1000);  // 1 kHz
+    field_waveform_freq.set_value(1000);  // 1 kHz, like Flipper waveform
     field_gain.set_value(47);             // Max gain
     field_amp.set_value(1);               // Amp enabled
 
     text_range_number.set("00");
     text_range_total.set("/00");
 
-    // Enable Range 1 at 315 MHz, 100 kHz width
+    // Enable Range 1 at 315 MHz, 0 Hz width (falls back to 650 kHz)
     view_range_a.frequency_range.enabled = true;
     view_range_a.update_center(315000000);
-    view_range_a.update_width(100000);
+    view_range_a.update_width(0);
     view_range_a.check_enabled.set_value(true);
 
     // Add handlers for dynamic setting updates

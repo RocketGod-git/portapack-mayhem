@@ -54,6 +54,9 @@ class JammerProcessor : public BasebandProcessor {
     int8_t re{0}, im{0};
     uint32_t wave_phase{0};
     uint32_t wave_index{0};
+    uint32_t square_counter{0};
+    uint32_t saw_counter{0};
+    uint32_t tri_counter{0};
     float chirp_freq{0.0f};
     uint32_t waveform_freq{1000};  // Default 1 kHz
     RetuneMessage message{};
