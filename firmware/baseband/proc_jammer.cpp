@@ -64,13 +64,13 @@ void JammerProcessor::execute(const buffer_c8_t& buffer) {
             period_counter = noise_period;
 
             if (noise_type == jammer::JammerType::TYPE_FSK) {
-                sample = (sample + lfsr) >> 1;
+                sample = (lfsr & 0xFF) - 128;  // Full ±127 range
             } else if (noise_type == jammer::JammerType::TYPE_TONE) {
                 tone_delta = 150000 + (lfsr >> 9);
             } else if (noise_type == jammer::JammerType::TYPE_SWEEP) {
                 sample++;
             } else if (noise_type == jammer::JammerType::TYPE_RANDOM) {
-                sample = lfsr & 0xFF;
+                sample = (lfsr & 0xFF) - 128;  // Full ±127 range
             } else if (noise_type == jammer::JammerType::TYPE_SINE) {
                 uint32_t phase_increment = (waveform_freq * (1ULL << 32)) / 3072000;
                 wave_phase += phase_increment;

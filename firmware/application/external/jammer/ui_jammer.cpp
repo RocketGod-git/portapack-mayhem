@@ -151,8 +151,6 @@ RangeView::RangeView(NavigationView& nav) {
             update_stop(stop);
         };
     };
-
-    check_enabled.set_value(false);
 }
 
 void JammerView::focus() {
@@ -176,6 +174,14 @@ void JammerView::set_jammer_channel(uint32_t i, uint32_t width, uint64_t center,
     jammer_channels[i].width = (width * 0xFFFFFFULL) / 1536000;
     jammer_channels[i].center = center;
     jammer_channels[i].duration = (duration == 0) ? 0xFFFFFFFF : 30720 * duration;
+}
+
+void JammerView::update_tx_settings() {
+    if (jamming) {
+        transmitter_model.set_rf_amp(field_amp.value());
+        transmitter_model.set_tx_gain(field_gain.value());
+        baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), field_waveform_freq.value());
+    }
 }
 
 void JammerView::start_tx() {
@@ -241,6 +247,48 @@ void JammerView::start_tx() {
         transmitter_model.enable();
         baseband::set_jammer(true, (JammerType)options_type.selected_index(), options_speed.selected_index_value(), field_waveform_freq.value());
         mscounter = 0;
+
+        // Debug: Confirm TX parameters
+        std::string type_str;
+        switch (options_type.selected_index()) {
+            case 0:
+                type_str = "Rand FSK";
+                break;
+            case 1:
+                type_str = "FM tone";
+                break;
+            case 2:
+                type_str = "CW sweep";
+                break;
+            case 3:
+                type_str = "Noise";
+                break;
+            case 4:
+                type_str = "Sine";
+                break;
+            case 5:
+                type_str = "Square";
+                break;
+            case 6:
+                type_str = "Sawtooth";
+                break;
+            case 7:
+                type_str = "Triangle";
+                break;
+            case 8:
+                type_str = "Chirp";
+                break;
+            case 9:
+                type_str = "Gauss";
+                break;
+            case 10:
+                type_str = "Brute";
+                break;
+            default:
+                type_str = "Unknown";
+                break;
+        }
+        nav_.display_modal("TX Started", "Freq: 315 MHz\nType: " + type_str + "\nGain: " + to_string_dec_uint(field_gain.value()) + "\nAmp: " + to_string_dec_uint(field_amp.value()));
     } else {
         if (out_of_ranges)
             nav_.display_modal("Error", "Jamming bandwidth too large.\nMust be less than 24MHz.");
@@ -323,16 +371,42 @@ JammerView::JammerView(NavigationView& nav)
     view_range_b.set_parent_rect(view_rect);
     view_range_c.set_parent_rect(view_rect);
 
-    options_type.set_selected_index(3);
-    options_speed.set_selected_index(3);
-    options_hop.set_selected_index(0);
+    options_type.set_selected_index(4);   // Sine for better RX detection
+    options_speed.set_selected_index(3);  // 10kHz
+    options_hop.set_selected_index(0);    // Off
     button_transmit.set_style(&style_val);
     field_timetx.set_value(30);
-    field_timepause.set_value(0);
-    field_jitter.set_value(0);
-    field_waveform_freq.set_value(1000);
-    field_gain.set_value(transmitter_model.tx_gain());
-    field_amp.set_value(transmitter_model.rf_amp());
+    field_timepause.set_value(0);         // Off
+    field_jitter.set_value(0);            // Off
+    field_waveform_freq.set_value(1000);  // 1 kHz
+    field_gain.set_value(47);             // Max gain
+    field_amp.set_value(1);               // Amp enabled
+
+    text_range_number.set("00");
+    text_range_total.set("/00");
+
+    // Enable Range 1 at 315 MHz, 100 kHz width
+    view_range_a.frequency_range.enabled = true;
+    view_range_a.update_center(315000000);
+    view_range_a.update_width(100000);
+    view_range_a.check_enabled.set_value(true);
+
+    // Add handlers for dynamic setting updates
+    options_type.on_change = [this](size_t, OptionsField::value_t) {
+        update_tx_settings();
+    };
+    field_waveform_freq.on_change = [this](int32_t) {
+        update_tx_settings();
+    };
+    options_speed.on_change = [this](size_t, OptionsField::value_t) {
+        update_tx_settings();
+    };
+    field_gain.on_change = [this](int32_t) {
+        update_tx_settings();
+    };
+    field_amp.on_change = [this](int32_t) {
+        update_tx_settings();
+    };
 
     button_transmit.on_select = [this](Button&) {
         if (jamming || cooling)
