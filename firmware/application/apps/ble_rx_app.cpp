@@ -2,6 +2,7 @@
  * Copyright (C) 2014 Jared Boone, ShareBrained Technology, Inc.
  * Copyright (C) 2017 Furrtek
  * Copyright (C) 2023 TJ Baginski
+ * Copyright (C) 2025 Tommaso Ventafridda
  *
  * This file is part of PortaPack.
  *
@@ -22,7 +23,6 @@
  */
 
 #include "ble_rx_app.hpp"
-#include "ble_rx_app.hpp"
 #include "ui_modemsetup.hpp"
 
 #include "modems.hpp"
@@ -34,6 +34,7 @@
 #include "portapack_persistent_memory.hpp"
 #include "ui_fileman.hpp"
 #include "ui_textentry.hpp"
+#include "usb_serial_asyncmsg.hpp"
 
 using namespace portapack;
 using namespace modems;
@@ -81,6 +82,50 @@ void reverse_byte_array(uint8_t* arr, int length) {
         start++;
         end--;
     }
+}
+
+MAC_VENDOR_STATUS lookup_mac_vendor_status(const uint8_t* mac_address, std::string& vendor_name) {
+    static bool db_checked = false;
+    static bool db_exists = false;
+
+    if (!db_checked) {
+        database db;
+        database::MacAddressDBRecord dummy_record;
+        int test_result = db.retrieve_macaddress_record(&dummy_record, "000000");
+        db_exists = (test_result != DATABASE_NOT_FOUND);
+        db_checked = true;
+    }
+
+    if (!db_exists) {
+        vendor_name = "macaddress.db not found";
+        return MAC_DB_NOT_FOUND;
+    }
+
+    database db;
+    database::MacAddressDBRecord record;
+
+    // Convert MAC address to hex string
+    std::string mac_hex = "";
+    for (int i = 0; i < 3; i++) {
+        // Only need first 3 bytes for OUI
+        mac_hex += to_string_hex(mac_address[i], 2);
+    }
+
+    int result = db.retrieve_macaddress_record(&record, mac_hex);
+
+    if (result == DATABASE_RECORD_FOUND) {
+        vendor_name = std::string(record.vendor_name);
+        return MAC_VENDOR_FOUND;
+    } else {
+        vendor_name = "Unknown";
+        return MAC_VENDOR_NOT_FOUND;
+    }
+}
+
+std::string lookup_mac_vendor(const uint8_t* mac_address) {
+    std::string vendor_name;
+    lookup_mac_vendor_status(mac_address, vendor_name);
+    return vendor_name;
 }
 
 namespace ui {
@@ -165,7 +210,10 @@ void RecentEntriesTable<BleRecentEntries>::draw(
     line += pad_string_with_spaces(db_spacing) + dbStr;
 
     line.resize(target_rect.width() / 8, ' ');
-    painter.draw_string(target_rect.location(), style, line);
+
+    Style row_style = (entry.vendor_status == MAC_VENDOR_FOUND) ? style : Style{style.font, style.background, Color::grey()};
+
+    painter.draw_string(target_rect.location(), row_style, line);
 }
 
 BleRecentEntryDetailView::BleRecentEntryDetailView(NavigationView& nav, const BleRecentEntry& entry)
@@ -178,10 +226,14 @@ BleRecentEntryDetailView::BleRecentEntryDetailView(NavigationView& nav, const Bl
                   &text_mac_address,
                   &label_pdu_type,
                   &text_pdu_type,
+                  &label_vendor,
+                  &text_vendor,
                   &labels});
 
     text_mac_address.set(to_string_mac_address(entry.packetData.macAddress, 6, false));
     text_pdu_type.set(pdu_type_to_string(entry.pduType));
+    std::string vendor_name = lookup_mac_vendor(entry.packetData.macAddress);
+    text_vendor.set(vendor_name);
 
     button_done.on_select = [&nav](const ui::Button&) {
         nav.pop();
@@ -203,6 +255,7 @@ BleRecentEntryDetailView::BleRecentEntryDetailView(NavigationView& nav, const Bl
             nav,
             packetFileBuffer,
             64,
+            ENTER_KEYBOARD_MODE_ALPHA,
             [this, packetToSave](std::string& buffer) {
                 on_save_file(buffer, packetToSave);
             });
@@ -369,6 +422,10 @@ void BleRecentEntryDetailView::paint(Painter& painter) {
 
 void BleRecentEntryDetailView::set_entry(const BleRecentEntry& entry) {
     entry_ = entry;
+    text_mac_address.set(to_string_mac_address(entry.packetData.macAddress, 6, false));
+    text_pdu_type.set(pdu_type_to_string(entry.pduType));
+    std::string vendor_name = lookup_mac_vendor(entry.packetData.macAddress);
+    text_vendor.set(vendor_name);
     set_dirty();
 }
 
@@ -446,6 +503,8 @@ BLERxView::BLERxView(NavigationView& nav)
                   &button_switch,
                   &recent_entries_view});
 
+    async_tx_states_when_entered = portapack::async_tx_enabled;
+
     recent_entries_view.on_select = [this](const BleRecentEntry& entry) {
         nav_.push<BleRecentEntryDetailView>(entry);
     };
@@ -453,9 +512,9 @@ BLERxView::BLERxView(NavigationView& nav)
     check_serial_log.on_select = [this](Checkbox&, bool v) {
         serial_logging = v;
         if (v) {
-            usb_serial_thread = std::make_unique<UsbSerialThread>();
+            portapack::async_tx_enabled = true;
         } else {
-            usb_serial_thread.reset();
+            portapack::async_tx_enabled = false;
         }
     };
     check_serial_log.set_value(serial_logging);
@@ -471,6 +530,7 @@ BLERxView::BLERxView(NavigationView& nav)
             nav_,
             filterBuffer,
             64,
+            ENTER_KEYBOARD_MODE_ALPHA,
             [this](std::string& buffer) {
                 on_filter_change(buffer);
             });
@@ -493,6 +553,7 @@ BLERxView::BLERxView(NavigationView& nav)
             nav,
             listFileBuffer,
             64,
+            ENTER_KEYBOARD_MODE_ALPHA,
             [this](std::string& buffer) {
                 on_save_file(buffer);
             });
@@ -753,8 +814,7 @@ void BLERxView::on_data(BlePacketData* packet) {
     }
 
     if (serial_logging) {
-        usb_serial_thread->serial_str = str_console + "\r\n";
-        usb_serial_thread->str_ready = true;
+        UsbSerialAsyncmsg::asyncmsg(str_console);  // new line handled there, no need here.
     }
     str_console = "";
 
@@ -914,6 +974,7 @@ void BLERxView::set_parent_rect(const Rect new_parent_rect) {
 }
 
 BLERxView::~BLERxView() {
+    portapack::async_tx_enabled = async_tx_states_when_entered;
     receiver_model.disable();
     baseband::shutdown();
 }
@@ -946,6 +1007,11 @@ void BLERxView::updateEntry(const BlePacketData* packet, BleRecentEntry& entry, 
     entry.numHits++;
     entry.pduType = pdu_type;
     entry.channelNumber = channel_number;
+
+    if (entry.vendor_status == MAC_VENDOR_UNKNOWN) {
+        std::string vendor_name;
+        entry.vendor_status = lookup_mac_vendor_status(entry.packetData.macAddress, vendor_name);
+    }
 
     // Parse Data Section into buffer to be interpretted later.
     for (int i = 0; i < packet->dataLen; i++) {
